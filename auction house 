@@ -1,0 +1,687 @@
+import { world, system, EquipmentSlot, EntityEquippableComponent } from "@minecraft/server";
+import { ActionFormData, ModalFormData, MessageFormData } from "@minecraft/server-ui";
+
+///////////////////////////////////////////////////
+// MINECRAFT AUCTION HOUSE CONSOLIDATED MODULE
+// Gộp tất cả các file liên quan đến nhà đấu giá
+///////////////////////////////////////////////////
+
+// Cấu hình chính
+const Config = {
+    AdminList: ["admin", "operator"],
+    currencyPrefix: "$",
+    maxAuctionTime: 7 * 24 * 60 * 60 * 1000, // 7 ngày
+    minBidIncrement: 10,
+    auctionFee: 0.05, // 5% phí
+    maxAuction: 1000,
+    MoneyObjective: "Money"
+};
+
+///////////////////////////////////////////////////
+// UTILITY FUNCTIONS
+///////////////////////////////////////////////////
+
+const Utility = {
+    /**
+     * Extract Name from String
+     * @param {string} string 
+     * @param {number} index 
+     * @returns {Promise<{name: string, string: string}>}
+     */
+    async ExtractNameFromString(string, index) {
+        return new Promise((resolve) => {
+            let splitText = string.split(" ");
+            let result = { name: "", string: "" };
+            
+            if (splitText[index] && splitText[index].startsWith(`"`)) {
+                result.name += splitText[index];
+                let trimed = 1;
+                if (!splitText[index].endsWith(`"`)) {
+                    for (let i = index + 1; i <= splitText.length - 1; i++) {
+                        result.name += " " + splitText[i];
+                        trimed += 1;
+                        if (splitText[i].endsWith(`"`)) break;
+                    }
+                }
+                if (!result.name.endsWith(`"`)) { 
+                    resolve(result); 
+                    return;
+                }
+                result.name = result.name.replaceAll(`"`, "");
+                splitText.splice(index, trimed);
+                result.string = splitText.join(" ");
+            } else {
+                result.name = splitText[index];
+                splitText.splice(index, 1);
+                result.string = splitText.join(" ");
+            }
+            resolve(result);
+        });
+    },
+
+    /**
+     * Get Item name from ItemStack
+     * @param {import("@minecraft/server").ItemStack} item 
+     * @returns {string}
+     */
+    getItemname(item) {
+        return item.nameTag ? "§o" + item.nameTag : 
+               item.typeId.split(":")[1].split('_')
+               .map(v => v[0].toUpperCase() + v.slice(1).toLowerCase()).join(" ");
+    },
+
+    /**
+     * Capitalized String
+     * @param {string} string 
+     * @returns {string}
+     */
+    capitalized(string) {
+        return string.split('_').map(v => v[0].toUpperCase() + v.slice(1).toLowerCase()).join(" ");
+    },
+
+    /**
+     * Format Money
+     * @param {number} money 
+     * @param {boolean} withPrefix 
+     * @returns {string}
+     */
+    formatMoney(money, withPrefix = true) {
+        const formatted = money.toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,');
+        return `${withPrefix ? Config.currencyPrefix : ""}${formatted}`;
+    },
+
+    /**
+     * Roman Numeral Converter
+     * @param {number} num
+     * @returns {string}
+     */
+    toRomanNumeral(num) {
+        const lookup = { 
+            M: 1000, CM: 900, D: 500, CD: 400, C: 100, XC: 90, 
+            L: 50, XL: 40, X: 10, IX: 9, V: 5, IV: 4, I: 1 
+        };
+        let roman = '';
+        for (let i in lookup) {
+            while (num >= lookup[i]) {
+                roman += i;
+                num -= lookup[i];
+            }
+        }
+        return roman;
+    },
+
+    /**
+     * Compare strings for sorting
+     * @param {string} a 
+     * @param {string} b 
+     * @returns {number}
+     */
+    compareString(a, b) {
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+    },
+
+    /**
+     * Generate Random String
+     * @param {number} length
+     * @returns {string}
+     */
+    generateRandomString(length = 8) {
+        const characters = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        let id = '';
+        for (let i = 0; i < length; i++) {
+            const randomIndex = Math.floor(Math.random() * characters.length);
+            id += characters[randomIndex];
+        }
+        return id;
+    },
+
+    /**
+     * Enchantment to Text
+     * @param {import("@minecraft/server").Enchantment} enchant 
+     * @returns {string}
+     */
+    enchantToText(enchant) {
+        let level = this.toRomanNumeral(enchant.level);
+        let type = enchant.type.id;
+        let text = "";
+        
+        switch (type) {
+            case "binding":
+                text += "§cCurse of Binding";
+                break;
+            case "vanishing":
+                text += "§cCurse of Vanishing";
+                break;
+            default:
+                text += `§7${this.capitalized(type)}`;
+                break;
+        }
+        text += ` ${level}`;
+        return text;
+    },
+
+    /**
+     * Random number generator
+     * @param {number} min 
+     * @param {number} max 
+     * @returns {number}
+     */
+    random(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+    },
+
+    /**
+     * Convert time text to milliseconds
+     * @param {string} text
+     * @returns {number}
+     */
+    convertTextToMilliseconds(text) {
+        const timeFactors = {
+            'y': 365 * 24 * 60 * 60 * 1000,
+            'd': 24 * 60 * 60 * 1000,
+            'h': 60 * 60 * 1000,
+            'm': 60 * 1000,
+            's': 1000
+        };
+
+        const pattern = /(\d+)([dhms])/g;
+        let match;
+        let totalMilliseconds = 0;
+
+        while ((match = pattern.exec(text)) !== null) {
+            const value = parseInt(match[1]);
+            const unit = match[2];
+            if (timeFactors.hasOwnProperty(unit)) {
+                totalMilliseconds += value * timeFactors[unit];
+            }
+        }
+        return totalMilliseconds;
+    },
+
+    /**
+     * Format future date text
+     * @param {number} time
+     * @returns {string}
+     */
+    formatTextFutureDate(time) {
+        const DateNow = Date.now();
+        const DateTarget = time;
+        const CalculatedDate = Math.ceil((DateTarget - DateNow) / 1000);
+        if (CalculatedDate < 1) return `§e0 §aseconds`;
+        
+        let message = "";
+        if (CalculatedDate >= 86400) {
+            let day = Math.floor(CalculatedDate / 86400);
+            message += `§e${day} §adays, `;
+        }
+        if (CalculatedDate >= 3600) {
+            let hour = Math.floor(CalculatedDate / 3600);
+            message += `§e${hour % 24} §ahours, `;
+        }
+        if (CalculatedDate >= 60) {
+            let minute = Math.floor(CalculatedDate / 60);
+            message += `§e${minute % 60} §aminutes, `;
+        }
+        let second = CalculatedDate;
+        message += `§e${second % 60} §aseconds`;
+        return message;
+    },
+
+    /**
+     * Calculate average
+     * @param {number[]} array 
+     * @returns {number}
+     */
+    CalculateAverage(array) {
+        if (array.length === 0) return 0;
+        const total = array.reduce((sum, num) => sum + num, 0);
+        return total / array.length;
+    },
+
+    /**
+     * Format text with colors
+     * @param {string} text 
+     * @param {string} colorFormat 
+     * @returns {string}
+     */
+    formatColor(text, colorFormat) {
+        const colorCodes = colorFormat.match(/§./g);
+        if (!colorCodes) return text;
+
+        const words = text.split(' ');
+        let formattedText = '';
+        let colorIndex = 0;
+
+        for (let i = 0; i < words.length; i++) {
+            formattedText += colorCodes[colorIndex] + words[i];
+            if (i < words.length - 1) {
+                formattedText += ' ';
+            }
+            colorIndex = (colorIndex + 1) % colorCodes.length;
+        }
+        return formattedText;
+    }
+};
+
+///////////////////////////////////////////////////
+// DATABASE CLASS
+///////////////////////////////////////////////////
+
+class Database {
+    constructor(name) {
+        this.name = name;
+        this.data = new Map();
+        this.loadFromScoreboard();
+    }
+
+    loadFromScoreboard() {
+        try {
+        	system.run(() => {
+            const objective = world.scoreboard.getObjective(this.name);
+            if (objective) {
+                const participants = objective.getParticipants();
+                for (const participant of participants) {
+                    if (participant.type === "FakePlayer") {
+                        const key = participant.displayName;
+                        const score = objective.getScore(participant);
+                        if (score !== undefined) {
+                            // Store the score as is, or try to parse JSON
+                            this.data.set(key, score);
+                        }
+                    }
+                }
+            }
+            });
+        } catch (e) {
+            console.warn(`Failed to load database ${this.name}:`, e);
+        }
+    }
+
+    saveToScoreboard() {
+        try {
+        	system.run(() => {
+            let objective = world.scoreboard.getObjective(this.name);
+            if (!objective) {
+                objective = world.scoreboard.addObjective(this.name, this.name);
+            }
+
+            for (const [key, value] of this.data) {
+                const scoreValue = typeof value === 'object' ? 1 : Number(value) || 0;
+                objective.setScore(key, scoreValue);
+            }
+            });
+        } catch (e) {
+            console.warn(`Failed to save database ${this.name}:`, e);
+        }
+    }
+
+    set(key, value) {
+        this.data.set(key, value);
+        this.saveToScoreboard();
+    }
+
+    get(key) {
+        return this.data.get(key);
+    }
+
+    delete(key) {
+        const result = this.data.delete(key);
+        this.saveToScoreboard();
+        return result;
+    }
+
+    has(key) {
+        return this.data.has(key);
+    }
+
+    clear() {
+        this.data.clear();
+        this.saveToScoreboard();
+    }
+
+    keys() {
+        return this.data.keys();
+    }
+
+    values() {
+        return this.data.values();
+    }
+
+    entries() {
+        return this.data.entries();
+    }
+
+    forEach(callback) {
+        this.data.forEach(callback);
+    }
+}
+
+///////////////////////////////////////////////////
+// PLAYER EXTENSIONS
+///////////////////////////////////////////////////
+
+// Extend Player prototype với các method cần thiết
+Object.assign(system.run(() => {world.getAllPlayers().constructor.prototype}),
+	{
+    /**
+     * Check if Player is admin
+     * @returns {boolean}
+     */
+    isAdmin() {
+        return Config.AdminList.includes(this.name) || this.hasTag("admin");
+    },
+
+    /**
+     * Get Player Inventory
+     * @returns {import("@minecraft/server").Container}
+     */
+    getInventory() {
+        const inventoryComponent = this.getComponent("minecraft:inventory");
+        return inventoryComponent ? inventoryComponent.container : null;
+    },
+
+    /**
+     * Get Item amount in Inventory
+     * @param {string} typeId 
+     * @returns {number}
+     */
+    getItemAmount(typeId) {
+        let amount = 0;
+        const inventory = this.getInventory();
+        if (!inventory) return 0;
+        
+        for (let i = 0; i < inventory.size; i++) {
+            const item = inventory.getItem(i);
+            if (item && item.typeId === typeId) {
+                amount += item.amount;
+            }
+        }
+        return amount;
+    },
+
+    /**
+     * Check if player has Tag
+     * @param {string} tag 
+     * @returns {boolean}
+     */
+    checkTag(tag) {
+        return this.getTags().some(t => t.toLowerCase() === tag.toLowerCase());
+    },
+
+    /**
+     * Check if Player have permission
+     * @param {string} permission 
+     * @returns {boolean}
+     */
+    checkPermission(permission) {
+        return this.isAdmin() || this.hasTag(`permission:${permission}`);
+    },
+
+    /**
+     * Get Player's Money
+     * @returns {number}
+     */
+    getMoney() {
+        try {
+        	system.run(() => {
+            const objective = world.scoreboard.getObjective(Config.MoneyObjective);
+            if (objective) {
+                return objective.getScore(this) || 0;
+            }
+            });
+        } catch (e) {
+            console.warn("Failed to get money:", e);
+        }
+        return 0;
+    },
+
+    /**
+     * Set Player's Money
+     * @param {number} amount 
+     */
+    setMoney(amount) {
+        try {
+        	system.run(() => {
+            let objective = world.scoreboard.getObjective(Config.MoneyObjective);
+            if (!objective) {
+                objective = world.scoreboard.addObjective(Config.MoneyObjective, "Money");
+            }
+            objective.setScore(this, Math.floor(amount));
+            });
+        } catch (e) {
+            console.warn("Failed to set money:", e);
+        }
+    }
+});
+
+///////////////////////////////////////////////////
+// FORCE OPEN UTILITY
+///////////////////////////////////////////////////
+
+/**
+ * Force open form with retry mechanism
+ * @param {import("@minecraft/server").Player} player 
+ * @param {ActionFormData | ModalFormData | MessageFormData} form 
+ * @param {number} timeout 
+ * @returns {Promise<any>}
+ */
+const ForceOpen = async (player, form, timeout = 1200) => {
+    let startTick = system.currentTick;
+    while ((system.currentTick - startTick) < timeout) {
+        const response = await form.show(player);
+        if (response.cancelationReason !== "UserBusy") {
+            return response;
+        }
+        await new Promise(resolve => system.runTimeout(resolve, 5));
+    }
+    return { canceled: true };
+};
+
+///////////////////////////////////////////////////
+// CHEST FORM DATA CLASS
+///////////////////////////////////////////////////
+
+class ChestFormData {
+    constructor(size = "large") {
+        this.size = size;
+        this.titleText = "";
+        this.buttons = new Map();
+        this.patterns = [];
+    }
+
+    title(text) {
+        this.titleText = text;
+        return this;
+    }
+
+    button(slot, name, lore = [], texture = "minecraft:stone", stackAmount = 1, enchanted = false) {
+        this.buttons.set(slot, {
+            name: name,
+            lore: Array.isArray(lore) ? lore : [lore],
+            texture: texture,
+            stackAmount: stackAmount,
+            enchanted: enchanted
+        });
+        return this;
+    }
+
+    pattern(size, patterns, patternData = {}) {
+        for (let row = 0; row < patterns.length; row++) {
+            for (let col = 0; col < patterns[row].length; col++) {
+                const char = patterns[row][col];
+                if (patternData[char]) {
+                    const slot = size[1] + col + (size[0] + row) * 9;
+                    const data = patternData[char].data;
+                    const iconPath = patternData[char].iconPath;
+                    this.button(
+                        slot,
+                        data.itemName || "",
+                        data.itemDesc || [],
+                        iconPath || "minecraft:stone",
+                        data.stackAmount || 1,
+                        data.enchanted || false
+                    );
+                }
+            }
+        }
+        return this;
+    }
+
+    async show(player) {
+        // Convert to ActionForm for actual display
+        const form = new ActionFormData().title(this.titleText);
+        
+        // Add buttons in order
+        const sortedButtons = Array.from(this.buttons.entries()).sort((a, b) => a[0] - b[0]);
+        for (const [slot, buttonData] of sortedButtons) {
+            const buttonText = buttonData.name + (buttonData.lore.length > 0 ? "\n" + buttonData.lore.join("\n") : "");
+            form.button(buttonText, buttonData.texture);
+        }
+        
+        return await ForceOpen(player, form);
+    }
+}
+
+///////////////////////////////////////////////////
+// AUCTION ITEM DATABASE
+///////////////////////////////////////////////////
+
+class AuctionItemDatabase {
+    constructor(name) {
+        this.name = name;
+        this.database = new Database(`Auction_${name}`);
+        this.auctions = new Map();
+        this.loaded = true;
+    }
+
+    async waitLoaded() {
+        return Promise.resolve();
+    }
+
+    add(item, data) {
+        const id = data.id || Utility.generateRandomString(8);
+        const auctionData = {
+            ...data,
+            id: id,
+            item: {
+                typeId: item.typeId,
+                amount: item.amount,
+                nameTag: item.nameTag,
+                lore: item.getLore ? item.getLore() : []
+            }
+        };
+        
+        this.auctions.set(id, auctionData);
+        this.database.set(id, auctionData);
+        
+        return {
+            data: auctionData,
+            item: item,
+            isValid: () => true,
+            delete: () => this.remove(id),
+            unStore: (keepItem) => {
+                this.remove(id);
+                return item;
+            },
+            editData: (newData) => {
+                Object.assign(auctionData, newData);
+                this.database.set(id, auctionData);
+            }
+        };
+    }
+
+    remove(id) {
+        this.auctions.delete(id);
+        this.database.delete(id);
+    }
+
+    forEach(callback) {
+        for (const [id, data] of this.auctions) {
+            const auctionItem = {
+                data: data,
+                item: data.item,
+                isValid: () => true,
+                delete: () => this.remove(id),
+                unStore: (keepItem) => {
+                    this.remove(id);
+                    return data.item;
+                },
+                editData: (newData) => {
+                    Object.assign(data, newData);
+                    this.database.set(id, data);
+                }
+            };
+            callback(auctionItem);
+        }
+    }
+
+    get length() {
+        return this.auctions.size;
+    }
+
+    clear() {
+        this.auctions.clear();
+        this.database.clear();
+    }
+}
+
+///////////////////////////////////////////////////
+// MAIN AUCTION HOUSE CLASS
+///////////////////////////////////////////////////
+
+class AuctionHouse {
+    constructor() {
+        this.database = new AuctionItemDatabase("main");
+        this.isInitialized = true;
+        console.log("Auction House initialized");
+    }
+
+    async waitReady() {
+        return Promise.resolve();
+    }
+
+    /**
+     * Add item to auction
+     * @param {import("@minecraft/server").Player} player 
+     * @param {import("@minecraft/server").ItemStack} item 
+     * @param {number} startingPrice 
+     * @param {number} duration 
+     * @returns {Promise<boolean>}
+     */
+    async addItemToAuction(player, item, startingPrice, duration = Config.maxAuctionTime) {
+        if (startingPrice <= 0) {
+            player.sendMessage("§cGiá khởi điểm phải lớn hơn 0!");
+            return false;
+        }
+
+        try {
+            const auctionData = {
+                id: Utility.generateRandomString(8),
+                seller: player.name,
+                startPrice: startingPrice,
+                currentPrice: startingPrice,
+                highestBidder: null,
+                displayname: Utility.getItemname(item),
+                createdAt: Date.now(),
+                endTime: Date.now() + duration
+            };
+
+            // Remove item from player inventory
+            const inventory = player.getComponent("inventory");
+            if (inventory) {
+                for (let i = 0; i < inventory.size; i++) {
+                    const invItem = inventory.getItem(i);
+                    if (invItem && invItem.typeId === item.typeId) {
+                        inventory.setItem(i, undefined);
+                        break;
+                    }
+                }
+            }
+
+            this.database.add(item, auctionData);
+            player.sendMessage(`§aĐã thêm ${auctionData.displayname} vào đấu giá với giá ${Utility.formatMoney(startingPrice)}!`);
+            return true;
+        } catch (error) {
+            console.error("Failed to add au
